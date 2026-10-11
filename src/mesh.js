@@ -1,6 +1,6 @@
 import { joinRoom } from 'trystero';
 import { db } from './db';
-import { mergeRecord } from './api';
+import { applyStatus, mergeRecord } from './api';
 
 const config = { appId: 'disaster-mesh-app-v1' };
 const room = joinRoom(config, 'emergency-mesh-room');
@@ -24,7 +24,7 @@ export function initMesh(onPeerUpdate) {
   // Handle incoming status updates (e.g. resolving an incident)
   statusAction.onMessage = async (statusUpdate, peerId) => {
     if (statusUpdate && statusUpdate.id) {
-      await db.sosRequests.update(statusUpdate.id, { status: statusUpdate.status });
+      await applyStatus(statusUpdate.id, statusUpdate.status, statusUpdate.status_updated_at);
     }
   };
 
@@ -50,8 +50,8 @@ export function broadcastSos(record) {
 }
 
 // Broadcast resolution / status change to all connected peers
-export function broadcastStatusUpdate(id, status) {
+export function broadcastStatusUpdate(id, status, status_updated_at) {
   if (statusAction) {
-    statusAction.send({ id, status });
+    statusAction.send({ id, status, status_updated_at });
   }
 }

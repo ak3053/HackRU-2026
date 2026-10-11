@@ -1,14 +1,23 @@
 import asyncio
 from datetime import datetime, timezone
-from typing import Optional
+import os
+from typing import Literal, Optional
 import uuid
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
 import laya
 from pydantic import BaseModel, ConfigDict
 from storage import get_incident, initialize_db, list_recent_incidents, save_incident, update_status
+
+# Server-side secrets (ELEVENLABS_API_KEY) live in .env next to this file
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
+MAX_AUDIO_BYTES = 25 * 1024 * 1024
 
 
 
@@ -122,12 +131,17 @@ async def broadcast(payload: dict):
                 active_dashboards.remove(dashboard)
 
 
+# The dashboard's status names, and the dispatch_status storage.py keeps for each
+DISPATCH_STATUS = {"Pending": "new", "In Progress": "acknowledged", "Resolved": "resolved"}
+STATUS_LABEL = {stored: label for label, stored in DISPATCH_STATUS.items()}
+
+
 def incident_record(incident: dict) -> dict:
     """A stored incident as the dashboard's record, with the dispatcher's status applied."""
     record = dict(incident["response_body"]["triage"])
     record.setdefault("id", incident["incident_id"])
-    if incident["dispatch_status"] == "resolved":
-        record["status"] = "Resolved"
+    record["status"] = STATUS_LABEL[incident["dispatch_status"]]
+    record["status_updated_at"] = incident["updated_at_utc"]
     return record
 
 
@@ -186,12 +200,56 @@ def list_incidents(limit: int = Query(200, ge=1, le=500)):
     return [incident_record(incident) for incident in list_recent_incidents(limit)]
 
 
-@app.post("/api/incidents/{incident_id}/resolve")
-async def resolve_incident(incident_id: str):
-    if not await run_in_threadpool(update_status, incident_id, "resolved"):
+class StatusChange(BaseModel):
+    status: Literal["Pending", "In Progress", "Resolved"]
+
+
+@app.post("/api/incidents/{incident_id}/status")
+async def set_incident_status(incident_id: str, change: StatusChange):
+    """Move an incident between Pending, In Progress and Resolved, in any direction."""
+    if not await run_in_threadpool(update_status, incident_id, DISPATCH_STATUS[change.status]):
         raise HTTPException(status_code=404, detail="Unknown incident")
-    await broadcast({"type": "status", "id": incident_id, "status": "Resolved"})
-    return {"status": "success", "id": incident_id}
+    record = incident_record(await run_in_threadpool(get_incident, incident_id))
+    await broadcast({"type": "status", "id": incident_id, "status": record["status"],
+                     "status_updated_at": record["status_updated_at"]})
+    return {"status": "success", "id": incident_id, "incident_status": record["status"],
+            "status_updated_at": record["status_updated_at"]}
+
+
+@app.post("/api/transcribe")
+async def transcribe(request: Request):
+    """Speech to text for the victim form's microphone button, via ElevenLabs Scribe.
+
+    The browser posts the recording as the raw request body; the API key never leaves the server.
+    """
+    api_key = os.environ.get("ELEVENLABS_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Voice input is not set up: ELEVENLABS_API_KEY is missing.")
+
+    audio = await request.body()
+    if not audio:
+        raise HTTPException(status_code=400, detail="No audio received.")
+    if len(audio) > MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail="Recording is too long.")
+    content_type = request.headers.get("content-type", "application/octet-stream")
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            upstream = await client.post(
+                ELEVENLABS_STT_URL,
+                headers={"xi-api-key": api_key},
+                # Sound tags like "(sirens)" would only confuse the triage questions
+                data={"model_id": "scribe_v2", "tag_audio_events": "false"},
+                files={"file": ("speech", audio, content_type)},
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach ElevenLabs: {exc!r}")
+    if upstream.status_code != 200:
+        print(f"ElevenLabs speech-to-text failed ({upstream.status_code}): {upstream.text[:300]}")
+        raise HTTPException(status_code=502, detail=f"ElevenLabs returned {upstream.status_code}.")
+
+    result = upstream.json()
+    return {"text": (result.get("text") or "").strip(), "language_code": result.get("language_code")}
 
 
 # Run this file with: uvicorn main:app --host 0.0.0.0 --port 8000 --reload

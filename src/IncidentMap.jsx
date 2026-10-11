@@ -240,6 +240,7 @@ function describeIncident(incident) {
   }
   line(incident.message);
   if (incident.address) line(incident.address);
+  if (incident.status === 'In Progress') line('Response in progress');
   if (incident.status === 'Resolved') line('Resolved');
   return box;
 }

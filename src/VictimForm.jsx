@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
+import { Mic, Square } from 'lucide-react';
 import { db } from './db';
 import { broadcastSos } from './mesh';
-import { submitSos } from './api';
+import { submitSos, transcribeAudio } from './api';
 
 export default function VictimForm() {
   const [formData, setFormData] = useState({
@@ -10,6 +11,50 @@ export default function VictimForm() {
   });
   const [submitted, setSubmitted] = useState(false);
   const [loadingLocation, setLoadingLocation] = useState(false);
+  const [voice, setVoice] = useState('idle'); // idle | recording | transcribing
+  const [voiceError, setVoiceError] = useState(null);
+  const recorderRef = useRef(null);
+
+  // Record from the microphone; on stop, the server transcribes it and the text joins the message
+  const startRecording = async () => {
+    setVoiceError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      const chunks = [];
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) chunks.push(event.data);
+      };
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((track) => track.stop());
+        setVoice('transcribing');
+        try {
+          const text = await transcribeAudio(new Blob(chunks, { type: recorder.mimeType }));
+          if (text) {
+            setFormData((current) => ({
+              ...current,
+              message: current.message.trim() ? `${current.message.trimEnd()} ${text}` : text
+            }));
+          } else {
+            setVoiceError('No speech was heard. Please try again.');
+          }
+        } catch (error) {
+          setVoiceError(error.message || 'Could not turn the recording into text.');
+        }
+        setVoice('idle');
+      };
+      recorder.start();
+      recorderRef.current = recorder;
+      setVoice('recording');
+    } catch (error) {
+      console.warn('Microphone unavailable:', error);
+      setVoiceError('Microphone unavailable. Allow microphone access in the browser and try again.');
+    }
+  };
+
+  const stopRecording = () => {
+    if (recorderRef.current && recorderRef.current.state !== 'inactive') recorderRef.current.stop();
+  };
 
   // Fetch browser GPS coordinates
   const fetchCoordinates = () => {
@@ -136,9 +181,26 @@ export default function VictimForm() {
               rows="3"
               placeholder="Describe your situation..."
               className="mt-1 block w-full p-2.5 border border-gray-300 rounded-md" 
-              value={formData.message} 
-              onChange={e => setFormData({...formData, message: e.target.value})} 
+              value={formData.message}
+              onChange={e => setFormData({...formData, message: e.target.value})}
             />
+            <button
+              type="button"
+              onClick={voice === 'recording' ? stopRecording : startRecording}
+              disabled={voice === 'transcribing'}
+              aria-pressed={voice === 'recording'}
+              className={`mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-md border font-semibold text-sm transition-colors disabled:bg-gray-100 disabled:text-gray-400 ${
+                voice === 'recording'
+                  ? 'bg-red-600 border-red-600 text-white hover:bg-red-700'
+                  : 'bg-white border-gray-300 text-gray-700 hover:bg-gray-100'
+              }`}
+            >
+              {voice === 'recording' ? <Square size={16} /> : <Mic size={16} />}
+              {voice === 'recording'
+                ? 'Stop recording'
+                : voice === 'transcribing' ? 'Turning speech into text...' : 'Speak instead of typing'}
+            </button>
+            {voiceError && <p className="mt-1 text-sm text-red-600">{voiceError}</p>}
           </div>
 
           <button 

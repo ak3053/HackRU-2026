@@ -4,12 +4,18 @@ import { db } from './db';
 // forwards /api and /ws to main.py (see vite.config.js), so phones need only one address.
 const API_URL = import.meta.env.VITE_API_URL || window.location.origin;
 
+// An incident moves between these, in any direction
+export const STATUSES = ['Pending', 'In Progress', 'Resolved'];
+
 // A record has been through Laya once it carries per-category scores
 export const isTriaged = (record) => Boolean(record && record.category_scores);
 
 async function request(path, options = {}) {
   const response = await fetch(`${API_URL}${path}`, { signal: AbortSignal.timeout(15000), ...options });
-  if (!response.ok) throw new Error(`Triage server returned ${response.status} for ${path}`);
+  if (!response.ok) {
+    const detail = await response.json().then((body) => body.detail, () => null);
+    throw new Error(typeof detail === 'string' ? detail : `Triage server returned ${response.status} for ${path}`);
+  }
   return response.json();
 }
 
@@ -23,24 +29,52 @@ export async function submitSos(record) {
   return body.triage;
 }
 
-// Record a resolution in the server database
-export function resolveOnServer(id) {
-  return request(`/api/incidents/${encodeURIComponent(id)}/resolve`, { method: 'POST' });
+// Record a status change in the server database
+export function setStatusOnServer(id, status) {
+  return request(`/api/incidents/${encodeURIComponent(id)}/status`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status })
+  });
 }
 
-// Store an incoming record without losing a triage or a resolution this device already has
+// Turn a voice recording into text (ElevenLabs, via the server)
+export async function transcribeAudio(blob) {
+  const body = await request('/api/transcribe', {
+    method: 'POST',
+    headers: { 'Content-Type': blob.type || 'application/octet-stream' },
+    body: blob,
+    signal: AbortSignal.timeout(60000)
+  });
+  return body.text;
+}
+
+// When a record's status was last changed; records that never changed status count as oldest
+const statusTime = (record) => Date.parse(record.status_updated_at || '') || 0;
+
+// Apply a status change from elsewhere (mesh or server) unless this device has a newer one
+export async function applyStatus(id, status, statusUpdatedAt) {
+  const existing = await db.sosRequests.get(id);
+  if (!existing) return;
+  const incoming = { status, status_updated_at: statusUpdatedAt };
+  if (statusTime(incoming) >= statusTime(existing)) {
+    await db.sosRequests.update(id, incoming);
+  }
+}
+
+// Store an incoming record. Triage is never lost, and the most recent status change wins.
 export async function mergeRecord(record) {
   const existing = await db.sosRequests.get(record.id);
   if (!existing) {
     await db.sosRequests.put(record);
     return;
   }
-  const resolved = existing.status === 'Resolved' || record.status === 'Resolved';
-  const status = resolved ? 'Resolved' : existing.status;
+  const latest = statusTime(record) > statusTime(existing) ? record : existing;
+  const status = { status: latest.status, status_updated_at: latest.status_updated_at };
   if (isTriaged(record) && !isTriaged(existing)) {
-    await db.sosRequests.put({ ...record, status });
-  } else if (status !== existing.status) {
-    await db.sosRequests.update(record.id, { status });
+    await db.sosRequests.put({ ...record, ...status });
+  } else if (latest === record && record.status !== existing.status) {
+    await db.sosRequests.update(record.id, status);
   }
 }
 
@@ -51,7 +85,7 @@ export async function syncWithServer(onTriaged) {
   if (syncing) return;
   syncing = true;
   try {
-    // 1. Past incidents the server holds, with their resolved state
+    // 1. Past incidents the server holds, with their current status
     const incidents = await request('/api/incidents?limit=500');
     const serverStatus = new Map(incidents.map((incident) => [incident.id, incident.status]));
     for (const incident of incidents) await mergeRecord(incident);
@@ -63,11 +97,12 @@ export async function syncWithServer(onTriaged) {
           const triaged = await submitSos(local);
           await mergeRecord(triaged);
           serverStatus.set(triaged.id, triaged.status);
-          if (onTriaged) onTriaged({ ...triaged, status: local.status });
+          if (onTriaged) onTriaged({ ...triaged, status: local.status, status_updated_at: local.status_updated_at });
         }
-        // 3. Resolutions made while offline
-        if (local.status === 'Resolved' && serverStatus.has(local.id) && serverStatus.get(local.id) !== 'Resolved') {
-          await resolveOnServer(local.id);
+        // 3. Status changes made while offline. After the merge above, a local status that
+        //    still differs from the server's is the newer one.
+        if (serverStatus.has(local.id) && serverStatus.get(local.id) !== local.status) {
+          await setStatusOnServer(local.id, local.status);
         }
       } catch (error) {
         console.warn(`Could not sync SOS ${local.id}; will retry:`, error);
@@ -88,10 +123,10 @@ export function connectDispatch(onStatusChange) {
     socket = new WebSocket(`${API_URL.replace(/^http/, 'ws')}/ws/dispatch`);
     socket.onopen = () => onStatusChange && onStatusChange(true);
     socket.onmessage = (event) => {
-      // Either a status change ({type: 'status', id, status}) or a freshly triaged record
+      // Either a status change ({type: 'status', id, status, status_updated_at}) or a freshly triaged record
       const data = JSON.parse(event.data);
       const store = data.type === 'status'
-        ? db.sosRequests.update(data.id, { status: data.status })
+        ? applyStatus(data.id, data.status, data.status_updated_at)
         : mergeRecord(data);
       store.catch((error) => console.error('Failed to store server update:', error));
     };

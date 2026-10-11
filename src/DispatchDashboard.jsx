@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './db';
 import { initMesh, broadcastSos, broadcastStatusUpdate } from './mesh';
-import { connectDispatch, isTriaged, resolveOnServer, syncWithServer } from './api';
+import { connectDispatch, isTriaged, setStatusOnServer, STATUSES, syncWithServer } from './api';
 import IncidentMap from './IncidentMap';
 
 // Most pressing first: untriaged (severity unknown), then life threats, then by Laya's urgency score
@@ -19,19 +19,49 @@ const byPriority = (a, b) => {
   return 0;
 };
 
+const STATUS_TABS = {
+  'Pending': 'Active',
+  'In Progress': 'Response in Progress',
+  'Resolved': 'Resolved'
+};
+const EMPTY_MESSAGES = {
+  'Pending': 'No active emergency requests on the mesh network.',
+  'In Progress': 'No responses in progress.',
+  'Resolved': 'No resolved incidents yet.'
+};
+// The button that moves a card to each status
+const MOVE_BUTTONS = {
+  'Pending': {
+    label: { default: 'Back to Active', 'Resolved': 'Reopen as Active' },
+    style: 'bg-white text-gray-700 border border-gray-300 hover:bg-gray-100'
+  },
+  'In Progress': {
+    label: { default: 'Response in Progress' },
+    style: 'bg-blue-600 text-white hover:bg-blue-700'
+  },
+  'Resolved': {
+    label: { default: 'Mark as Resolved' },
+    style: 'bg-green-600 text-white hover:bg-green-700'
+  }
+};
+
 export default function DispatchDashboard() {
   const [nodeCount, setNodeCount] = useState(1);
   const [serverOnline, setServerOnline] = useState(false);
-  const [view, setView] = useState('active');
+  const [view, setView] = useState('Pending');
 
-  // Fetch all requests and filter out resolved ones
+  // Every request, split by status. Anything without a known status counts as Pending.
   const requests = useLiveQuery(() => db.sosRequests.toArray(), []) || [];
-  const activeRequests = requests.filter(req => req.status !== 'Resolved').sort(byPriority);
-  // Resolved incidents, newest first
-  const resolvedRequests = requests
-    .filter(req => req.status === 'Resolved')
-    .sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')));
-  const visibleRequests = view === 'active' ? activeRequests : resolvedRequests;
+  const statusOf = (req) => (STATUSES.includes(req.status) ? req.status : 'Pending');
+  const byStatus = {
+    'Pending': requests.filter(req => statusOf(req) === 'Pending').sort(byPriority),
+    'In Progress': requests.filter(req => statusOf(req) === 'In Progress').sort(byPriority),
+    // Resolved incidents, newest first
+    'Resolved': requests
+      .filter(req => statusOf(req) === 'Resolved')
+      .sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')))
+  };
+  const visibleRequests = byStatus[view];
   const untriagedCount = requests.filter(req => !isTriaged(req)).length;
 
   useEffect(() => {
@@ -48,11 +78,12 @@ export default function DispatchDashboard() {
     }
   }, [serverOnline, untriagedCount]);
 
-  const handleResolve = async (id) => {
-    await db.sosRequests.update(id, { status: 'Resolved' });
-    broadcastStatusUpdate(id, 'Resolved');
+  const handleStatusChange = async (id, status) => {
+    const status_updated_at = new Date().toISOString();
+    await db.sosRequests.update(id, { status, status_updated_at });
+    broadcastStatusUpdate(id, status, status_updated_at);
     // Offline or not yet on the server: the next sync records it
-    resolveOnServer(id).catch((error) => console.warn(`Resolution of ${id} not yet saved to server:`, error));
+    setStatusOnServer(id, status).catch((error) => console.warn(`Status of ${id} not yet saved to server:`, error));
   };
 
   return (
@@ -72,37 +103,32 @@ export default function DispatchDashboard() {
             Active Nodes: {nodeCount}
           </span>
           <span className="bg-red-100 text-red-800 px-3 py-1 rounded-full text-sm font-semibold">
-            Active Incidents: {activeRequests.length}
+            Open Incidents: {byStatus['Pending'].length + byStatus['In Progress'].length}
           </span>
         </div>
       </div>
 
       <IncidentMap incidents={requests} />
 
-      <div className="flex gap-2 mb-4">
-        {[
-          { id: 'active', label: `Active (${activeRequests.length})` },
-          { id: 'resolved', label: `Resolved (${resolvedRequests.length})` }
-        ].map((tab) => (
+      <div className="flex flex-wrap gap-2 mb-4">
+        {STATUSES.map((status) => (
           <button
-            key={tab.id}
+            key={status}
             type="button"
-            onClick={() => setView(tab.id)}
-            aria-pressed={view === tab.id}
+            onClick={() => setView(status)}
+            aria-pressed={view === status}
             className={`px-4 py-1.5 rounded-md text-sm font-semibold shadow-sm ${
-              view === tab.id ? 'bg-gray-800 text-white' : 'bg-white text-gray-700 hover:bg-gray-200'
+              view === status ? 'bg-gray-800 text-white' : 'bg-white text-gray-700 hover:bg-gray-200'
             }`}
           >
-            {tab.label}
+            {STATUS_TABS[status]} ({byStatus[status].length})
           </button>
         ))}
       </div>
 
       {visibleRequests.length === 0 ? (
         <div className="text-center p-12 bg-white rounded-lg shadow text-gray-500">
-          {view === 'active'
-            ? 'No active emergency requests on the mesh network.'
-            : 'No resolved incidents yet.'}
+          {EMPTY_MESSAGES[view]}
         </div>
       ) : (
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
@@ -110,7 +136,7 @@ export default function DispatchDashboard() {
             <div
               key={req.id}
               className={`p-4 rounded-lg shadow bg-white border-l-4 flex flex-col justify-between ${
-                view === 'resolved'
+                view === 'Resolved'
                   ? 'border-gray-400'
                   : req.is_life_threatening ? 'border-red-600' : 'border-yellow-500'
               }`}
@@ -151,25 +177,25 @@ export default function DispatchDashboard() {
 
                 <div className="mt-2 text-xs text-gray-400">
                   {req.timestamp
-                    ? view === 'resolved'
+                    ? view === 'Resolved'
                       ? new Date(req.timestamp).toLocaleString()
                       : new Date(req.timestamp).toLocaleTimeString()
                     : ''}
                 </div>
               </div>
 
-              {view === 'resolved' ? (
-                <div className="mt-4 w-full bg-gray-100 text-gray-600 py-1.5 px-3 rounded text-sm font-semibold text-center">
-                  Resolved
-                </div>
-              ) : (
-                <button
-                  onClick={() => handleResolve(req.id)}
-                  className="mt-4 w-full bg-green-600 text-white py-1.5 px-3 rounded text-sm font-semibold hover:bg-green-700 transition-colors shadow-sm"
-                >
-                  Mark as Resolved
-                </button>
-              )}
+              {/* Move to either of the other two statuses; nothing is final */}
+              <div className="mt-4 flex gap-2">
+                {STATUSES.filter((status) => status !== view).map((status) => (
+                  <button
+                    key={status}
+                    onClick={() => handleStatusChange(req.id, status)}
+                    className={`flex-1 py-1.5 px-3 rounded text-sm font-semibold transition-colors shadow-sm ${MOVE_BUTTONS[status].style}`}
+                  >
+                    {MOVE_BUTTONS[status].label[view] || MOVE_BUTTONS[status].label.default}
+                  </button>
+                ))}
+              </div>
             </div>
           ))}
         </div>
