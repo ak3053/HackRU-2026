@@ -1,0 +1,45 @@
+
+None selected
+
+Skip to content
+Using Rutgers University Mail with screen readers
+Conversations
+    
+ 
+Program Policies
+Powered by Google
+Last account activity: 0 minutes ago
+Open in 1 other location · Details
+important. Press tab to insert.
+
+{
+  "status": "success",
+  "message": "SOS received and routed.",
+  "triage": {
+    "phone_number": "14124",
+    "original_message": "There is a man trapped in a house fire. The house has collapsed",
+    "is_life_threatening": true,
+    "threat_confidence": 0.8,
+    "category": "Fire",
+    "category_confidence": 0.91,
+    "categories": [
+      "Fire",
+      "Trapped/Structural",
+      "Medical"
+    ],
+    "category_scores": {
+      "Fire": 0.91,
+      "Trapped/Structural": 0.87,
+      "Medical": 0.81,
+      "Natural Disaster": 0.13,
+      "Supply/Ration": 0.05,
+      "Flood": 0
+    },
+    "urgency": 3,
+    "urgency_label": "serious",
+    "urgency_score": 2.92
+  }
+}
+
+response_1791661652050.json
+Displaying response_1791661652050.json.
